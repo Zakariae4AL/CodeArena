@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -147,14 +148,22 @@ func execute(ctx context.Context, opts Options, lang protocol.Language, argv []s
 		return res
 	}
 
+	// The timer runs on another goroutine: it reports through an atomic flag, and we
+	// wait for it to finish before reading the result.
+	var timedOut atomic.Bool
+	fired := make(chan struct{})
 	timer := time.AfterFunc(wall, func() {
-		res.timedOut = true
+		defer close(fired)
+		timedOut.Store(true)
 		killGroup()
 	})
 	stop := context.AfterFunc(ctx, killGroup)
 	err := cmd.Wait()
-	timer.Stop()
+	if !timer.Stop() {
+		<-fired
+	}
 	stop()
+	res.timedOut = timedOut.Load()
 	// Kill anything the program left behind (forks, daemons, fork bombs).
 	if cmd.Process != nil {
 		killAll(cmd.Process.Pid)
