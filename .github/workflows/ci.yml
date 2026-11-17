@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  judge:
+    name: Judge (Go)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+    defaults:
+      run:
+        working-directory: judge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: judge/go.mod
+      - name: Format
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - name: Test (real compilers + Redis)
+        run: go test -race -count=1 ./...
+        env:
+          REDIS_ADDR: localhost:6379
+
+  sandbox:
+    name: Sandbox (Docker)
+    runs-on: ubuntu-latest
+    needs: judge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: judge/go.mod
+      - name: Build runner images
+        run: |
+          for lang in cpp java python javascript; do
+            docker build -q --target runner-$lang -t codearena/runner-$lang judge
+          done
+      - name: Escape tests (network, file system, fork bomb, memory)
+        working-directory: judge
+        run: go test -count=1 -run TestRealSandbox -v ./internal/sandbox/
+        env:
+          JUDGE_DOCKER_IT: "1"
+
+  core:
+    name: Core (Spring Boot)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Build, test and verify module boundaries
+        run: chmod +x mvnw && ./mvnw -B verify
+        env:
+          REDIS_HOST: localhost
+      - name: Upload module diagrams
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-modulith-docs
+          path: core/target/spring-modulith-docs
+          if-no-files-found: ignore
+
+  web:
+    name: Web (React)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
